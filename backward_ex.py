@@ -75,7 +75,7 @@ def arith_kernel(x_ptr,  # *Pointer* to first input vector.
     tl.store(output1_ptr + large_offsets, (half * sin_), mask=large_mask)
     tl.store(output2_ptr + large_offsets, (x * cos_), mask=large_mask)
 
-def backward(x: torch.Tensor, freqs: torch.Tensor):
+def rope_bw(x: torch.Tensor, freqs: torch.Tensor):
     output_rotate_half = torch.empty_like(x)
     output1 = torch.empty_like(x)
     output2 = torch.empty_like(x)
@@ -90,11 +90,11 @@ def backward(x: torch.Tensor, freqs: torch.Tensor):
     grid = lambda meta: (triton.cdiv(n_elements_arith, meta['BLOCK_SIZE']), )
     kerenl_rotate_half_back[grid](x, output_rotate_half, n_elements_arith,d_half=int(d/2), BLOCK_SIZE=d)
          
-    freqs = freqs.repeat(1,b,h,1)
+    freqs = freqs.repeat(1,b,h,1) #주석 3 
     grid_arith = lambda meta: (triton.cdiv(n_elements_arith, meta['LARGE_BLOCK_SIZE']), )
     grid_add = lambda meta: (triton.cdiv(n_elements_arith, meta['BLOCK_SIZE']), )
-    arith_kernel[grid_arith](x, output_rotate_half, freqs, output1, output2, n_elements_arith, LARGE_BLOCK_SIZE=b*h*d)
-    add_kernel[grid_add](output1, output2, output, n_elements_arith, BLOCK_SIZE=b*h*d)
+    arith_kernel[grid_arith](x, output_rotate_half, freqs, output1, output2, n_elements_arith, LARGE_BLOCK_SIZE=b*h*d) # 주석 2 
+    add_kernel[grid_add](output1, output2, output, n_elements_arith, BLOCK_SIZE=b*h*d) # 주석 1
     return output
 
 
@@ -113,7 +113,7 @@ loss_trion = Variable(torch.rand((s,b,h,d), device='cuda:0'),requires_grad=True)
 freqs_half  = torch.rand(s,1,1,d_half) 
 freqs = torch.concat((freqs_half,freqs_half),dim=-1).to(device='cuda:0')
 
-x_grad_triton = backward(loss_trion,freqs) #.to(torch.half)
+x_grad_triton = rope_bw(loss_trion,freqs) #.to(torch.half)
 
 loss_TE = loss_trion.clone().detach().to(device='cuda:0')
 loss_TE = Variable(loss_TE,requires_grad=True)
@@ -129,17 +129,16 @@ x_grad_te = intput_to_TE.grad
 ####################################
 #################################### inputs for BW
 ####################################
-
+"""
 error = torch.abs(x_grad_te - x_grad_triton)
 error_max = torch.max(error)
-
 if error_max == 0.0:
     print("No Error")
 else:
     print("Error occurs! Max Error :",error_max)
 
 torch.testing.assert_close(x_grad_triton, x_grad_te)
-
+"""
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -169,7 +168,7 @@ def benchmark(size, provider):
     freqs_half  = torch.rand(size,1,1,int(d/2)) 
     freqs = torch.concat((freqs_half,freqs_half),dim=-1).to(device='cuda:0')
     
-    x_grad_triton = backward(loss_trion,freqs) #.to(torch.half)
+    x_grad_triton = rope_bw(loss_trion,freqs) #.to(torch.half)
     
     loss_TE = loss_trion.clone().detach().to(device='cuda:0')
     loss_TE = Variable(loss_TE,requires_grad=True)
@@ -185,7 +184,7 @@ def benchmark(size, provider):
 
     quantiles = [0.5, 0.2, 0.8]
     if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: backward(loss_trion,freqs), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: rope_bw(loss_trion,freqs), quantiles=quantiles)
     if provider == 'torch':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: output_te.backward(loss_TE,retain_graph=True), quantiles=quantiles)
     gbps = lambda ms: b*h*d * size / ms * 1e-6

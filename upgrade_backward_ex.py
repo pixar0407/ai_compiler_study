@@ -61,7 +61,7 @@ def arith_kernel(x_ptr,  # *Pointer* to first input vector.
     half = tl.load(half_ptr + large_offsets, mask=large_mask)
     tl.store(output_ptr + large_offsets,(x * cos_)+(half * sin_), mask=large_mask)
 
-def backward(x: torch.Tensor, freqs: torch.Tensor):
+def rope_bw(x: torch.Tensor, freqs: torch.Tensor):
     output_rotate_half = torch.empty_like(x)
     output = torch.empty_like(x)
 
@@ -94,7 +94,7 @@ loss_trion = Variable(torch.rand((s,b,h,d), device='cuda:0'),requires_grad=True)
 freqs_half  = torch.rand(s,1,1,d_half) 
 freqs = torch.concat((freqs_half,freqs_half),dim=-1).to(device='cuda:0')
 
-x_grad_triton = backward(loss_trion,freqs) #.to(torch.half)
+x_grad_triton = rope_bw(loss_trion,freqs) #.to(torch.half)
 
 loss_TE = loss_trion.clone().detach().to(device='cuda:0')
 loss_TE = Variable(loss_TE,requires_grad=True)
@@ -110,15 +110,14 @@ x_grad_te = intput_to_TE.grad
 ####################################
 #################################### inputs for BW
 ####################################
-
+"""
 error = torch.abs(x_grad_te - x_grad_triton)
 error_max = torch.max(error)
-
 if error_max == 0.0:
     print("No Error")
 else:
     print("Error occurs! Max Error :",error_max)
-
+"""
 torch.testing.assert_close(x_grad_triton, x_grad_te)
 
 
@@ -150,7 +149,7 @@ def benchmark(size, provider):
     freqs_half  = torch.rand(size,1,1,int(d/2)) 
     freqs = torch.concat((freqs_half,freqs_half),dim=-1).to(device='cuda:0')
     
-    x_grad_triton = backward(loss_trion,freqs) #.to(torch.half)
+    x_grad_triton = rope_bw(loss_trion,freqs) #.to(torch.half)
     
     loss_TE = loss_trion.clone().detach().to(device='cuda:0')
     loss_TE = Variable(loss_TE,requires_grad=True)
@@ -166,7 +165,7 @@ def benchmark(size, provider):
 
     quantiles = [0.5, 0.2, 0.8]
     if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: backward(loss_trion,freqs), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: rope_bw(loss_trion,freqs), quantiles=quantiles)
     if provider == 'torch':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: output_te.backward(loss_TE,retain_graph=True), quantiles=quantiles)
     gbps = lambda ms: b*h*d * size / ms * 1e-6

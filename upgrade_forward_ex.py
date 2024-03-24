@@ -57,7 +57,7 @@ def arith_kernel(x_ptr,  # *Pointer* to first input vector.
     half = tl.load(half_ptr + large_offsets, mask=large_mask)
     tl.store(output_ptr + large_offsets, (x * cos_)+(half * sin_), mask=large_mask)
 
-def forward(x: torch.Tensor, freqs: torch.Tensor):
+def rope_fw(x: torch.Tensor, freqs: torch.Tensor):
     output_rotate_half = torch.empty_like(x)
     output = torch.empty_like(x)
 
@@ -88,18 +88,18 @@ freqs_half  = torch.rand(s,1,1,d_half)
 freqs = torch.concat((freqs_half,freqs_half),dim=-1).to(device='cuda:0')
 
 
-output_triton = forward(x,freqs) #.to(torch.half)
+output_triton = rope_fw(x,freqs) #.to(torch.half)
 output_te = apply_rotary_pos_emb(x,freqs) #.to(torch.half)
 
-
+"""
 error = torch.abs(output_te - output_triton)
 error_max = torch.max(error)
-
 if error_max == 0.0:
     print("No Error")
 else:
     print("Error occurs! Max Error :",error_max)
-
+"""
+    
 #assert torch.allclose(output_triton, output_te), (output_triton, output_te)
 torch.testing.assert_close(output_triton, output_te)
 
@@ -114,7 +114,7 @@ torch.testing.assert_close(output_triton, output_te)
         line_names=['Triton', 'Torch'],  # Label name for the lines.
         styles=[('blue', '-'), ('green', '-')],  # Line styles.
         ylabel='GB/s',  # Label name for the y-axis.
-        plot_name='forward performance',  # Name for the plot. Used also as a file name for saving the plot.
+        plot_name='performance',  # Name for the plot. Used also as a file name for saving the plot.
         args={},  # Values for function arguments not in `x_names` and `y_name`.
     ))
 def benchmark(size, provider):
@@ -130,7 +130,7 @@ def benchmark(size, provider):
     if provider == 'torch':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: apply_rotary_pos_emb(x, freqs), quantiles=quantiles)
     if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: forward(x,freqs), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: rope_fw(x,freqs), quantiles=quantiles)
     gbps = lambda ms: size*b*h*d / ms * 1e-6
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
