@@ -3,7 +3,8 @@ import triton
 import triton.language as tl
 from from_TransformerEngine import *
 from torch.autograd import Variable
-
+from torch.profiler import profile, record_function, ProfilerActivity
+import torch.cuda.nvtx as nvtx
 
 @triton.jit
 def kerenl_rotate_half(x_ptr,  # *Pointer* to first input vector.
@@ -77,10 +78,10 @@ def rope_fw(x: torch.Tensor, freqs: torch.Tensor):
 
 
 torch.manual_seed(5468)
-s=2048
+s=512
 b=8
-h=64
-d=128
+h=4
+d=2048
 d_half = int(d/2)
 
 x = Variable(torch.rand((s,b,h,d), device='cuda:0'),requires_grad=True)
@@ -103,31 +104,49 @@ else:
 #assert torch.allclose(output_triton, output_te), (output_triton, output_te)
 torch.testing.assert_close(output_triton, output_te)
 
+
+
 print("##########################")
 print("##########################")
-print("###### profiling #########")
+print("#####     profile    #####")
 print("##########################")
 print("##########################")
 
-print("##########################")
-print("######  my triton ########")
-print("##########################")
-with torch.autograd.profiler.profile(use_cuda=True) as prof:
-    output_triton = rope_fw(x,freqs) #.to(torch.half)
+def trace_handler(prof):
+    print(prof.key_averages().table(
+        sort_by="self_cuda_time_total", row_limit=-1))
+    prof.export_chrome_trace("./tmp/test_trace_" + str(prof.step_num) + "seventh.json")
 
-print(prof.key_averages().table(sort_by="cuda_time_total"))
+with torch.profiler.profile(    
+    activities=[
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.CUDA,
+    ],
 
-print("##########################")
-print("##### Tensor  Engine #####")
-print("##########################")
-with torch.autograd.profiler.profile(use_cuda=True) as prof:
-    output_te = apply_rotary_pos_emb(x,freqs) #.to(torch.half)
+    # In this example with wait=1, warmup=1, active=2, repeat=1,
+    # profiler will skip the first step/iteration,
+    # start warming up on the second, record
+    # the third and the forth iterations,
+    # after which the trace will become available
+    # and on_trace_ready (when set) is called;
+    # the cycle repeats starting with the next step
 
-print(prof.key_averages().table(sort_by="cuda_time_total"))
-
-
-
-
+    schedule=torch.profiler.schedule(
+        wait=1,
+        warmup=6,
+        active=1,
+        repeat=1),
+    on_trace_ready=trace_handler
+    # on_trace_ready=torch.profiler.tensorboard_trace_handler('./log')
+    # used when outputting for tensorboard
+    ) as p:
+        for iter in range(10):
+            #nvtx.range_push("{} : iter".format(iter))
+            #output_te = apply_rotary_pos_emb(x,freqs) #.to(torch.half)
+            output_triton = rope_fw(x,freqs) #.to(torch.half)
+            #nvtx.range_pop()
+            # send a signal to the profiler that the next iteration has started
+            p.step()
 
 
 
@@ -140,7 +159,7 @@ print("##########################")
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['size'],  # Argument names to use as an x-axis for the plot.
-        x_vals=[128*i for i in range(2, 32)],  # Different possible values for `x_name`.
+        x_vals=[2**i for i in range(3, 9, 1)],  # Different possible values for `x_name`.
         x_log=True,  # x axis is logarithmic.
         line_arg='provider',  # Argument name whose value corresponds to a different line in the plot.
         line_vals=['triton', 'torch'],  # Possible values for `line_arg`.
@@ -153,8 +172,8 @@ print("##########################")
 def benchmark(size, provider):
 
     b=8
-    h=64
-    d=128
+    h=4
+    d=2048
     x = Variable(torch.rand((size,b,h,d), device='cuda:0'),requires_grad=True)
     freqs_half  = torch.rand(size,1,1,int(d/2)) 
     freqs = torch.concat((freqs_half,freqs_half),dim=-1).to(device='cuda:0')
@@ -164,8 +183,7 @@ def benchmark(size, provider):
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: apply_rotary_pos_emb(x, freqs), quantiles=quantiles)
     if provider == 'triton':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: rope_fw(x,freqs), quantiles=quantiles)
-    #gbps = lambda ms: (size*b*h*d / ms) * 1e-6
-    gbps = lambda ms: (x.nelement() * x.element_size() * 2 / ms) * 1e-6
+    gbps = lambda ms: size*b*h*d / ms * 1e-6
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
 

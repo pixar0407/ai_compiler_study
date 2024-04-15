@@ -4,74 +4,57 @@ import triton.language as tl
 from from_TransformerEngine import *
 from torch.autograd import Variable
 
-
-@triton.jit
-def kerenl_rotate_half(x_ptr,  # *Pointer* to first input vector.
-               output_ptr,  # *Pointer* to output vector.
-               n_elements,  # Size of the vector.
-               d_half: tl.constexpr,
-               BLOCK_SIZE: tl.constexpr,  # Number of elements each program should process.
-               # NOTE: `constexpr` so it can be used as a shape value.
-               ):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0,d_half)
-    output_ptr_half = output_ptr + d_half
-    x_ptr_half      = x_ptr      + d_half
-    mask = offsets < n_elements
-
-    half_2 = tl.load(x_ptr_half + offsets, mask=mask)
-    tl.store(output_ptr + offsets, (-half_2), mask=mask)
-
-    half_1 = tl.load(x_ptr + offsets, mask=mask)
-    tl.store(output_ptr_half + offsets, half_1, mask=mask)
-
-
 @triton.jit
 def arith_kernel(x_ptr,  # *Pointer* to first input vector.
-               half_ptr,  # *Pointer* to second input vector.
                freqs_ptr,
                output_ptr,  # *Pointer* to output vector.
-               freq_repeat_size,
                n_elements,  # Size of the vector.
+               b,
+               h: tl.constexpr,
+               d: tl.constexpr,
+               d_half: tl.constexpr,
                BLOCK_SIZE: tl.constexpr,  # Number of elements each program should process.
                # NOTE: `constexpr` so it can be used as a shape value.
                ):
     
     pid = tl.program_id(axis=0)
 
-    freq_pid = pid // freq_repeat_size
+    freq_pid = pid // b
     freq_block_start = freq_pid * BLOCK_SIZE
-    freq_offsets = freq_block_start + tl.arange(0, BLOCK_SIZE)
+    freq_offsets = freq_block_start + tl.arange(0, (BLOCK_SIZE//2))
     freq_mask = freq_offsets < n_elements
 
     freqs = tl.load(freqs_ptr + freq_offsets, mask=freq_mask)
     cos_ = tl.cos(freqs)
     sin_ = tl.sin(freqs)
 
-    large_block_start = pid * BLOCK_SIZE
-    large_offsets = large_block_start + tl.arange(0, BLOCK_SIZE)
-    large_mask = large_offsets < n_elements
 
-    x = tl.load(x_ptr + large_offsets, mask=large_mask)
-    half = tl.load(half_ptr + large_offsets, mask=large_mask)
-    tl.store(output_ptr + large_offsets, (x * cos_)+(half * sin_), mask=large_mask)
+    for loop_idx in tl.static_range(0,h):
+        block_start = pid * ( h * d ) + loop_idx*BLOCK_SIZE
+        offsets     = block_start + tl.arange(0,d_half)
+        mask        = offsets < n_elements
+
+        output_ptr_half = output_ptr + d_half
+        x_ptr_half      = x_ptr      + d_half
+
+        half_2 = tl.load(x_ptr_half + offsets, mask=mask)
+        half_1 = tl.load(x_ptr + offsets, mask=mask)
+
+        tl.store(output_ptr      + offsets, (-half_2)*sin_ + half_1*cos_, mask=mask)
+        tl.store(output_ptr_half + offsets, half_1*sin_    + half_2*cos_, mask=mask)
+
 
 def rope_fw(x: torch.Tensor, freqs: torch.Tensor):
-    output_rotate_half = torch.empty_like(x)
     output = torch.empty_like(x)
 
-    assert x.is_cuda and freqs.is_cuda and output_rotate_half.is_cuda and output.is_cuda 
+    assert x.is_cuda and freqs.is_cuda and output.is_cuda 
 
     s,b,h,d = x.shape
     n_elements_arith = s*b*h*d
-
-    grid = lambda meta: (triton.cdiv(n_elements_arith, meta['BLOCK_SIZE']), )
-    kerenl_rotate_half[grid](x, output_rotate_half, n_elements_arith,d_half=int(d/2), BLOCK_SIZE=d)
-         
-    #freqs = freqs.repeat(1,b,h,1)
-    freq_repeat_size = b*h
-    arith_kernel[grid](x, output_rotate_half, freqs,output, freq_repeat_size,n_elements_arith, BLOCK_SIZE=d)
+ 
+    #freqs = freqs.repeat(1,1,1,1024)
+    grid = (s*b, )
+    arith_kernel[grid](x, freqs,output, n_elements_arith,b,h,d,d_half=int(d/2),BLOCK_SIZE=d)
     return output
 
 
@@ -91,6 +74,7 @@ freqs = torch.concat((freqs_half,freqs_half),dim=-1).to(device='cuda:0')
 output_triton = rope_fw(x,freqs) #.to(torch.half)
 output_te = apply_rotary_pos_emb(x,freqs) #.to(torch.half)
 
+
 """
 error = torch.abs(output_te - output_triton)
 error_max = torch.max(error)
@@ -103,6 +87,7 @@ else:
 #assert torch.allclose(output_triton, output_te), (output_triton, output_te)
 torch.testing.assert_close(output_triton, output_te)
 
+"""
 print("##########################")
 print("##########################")
 print("###### profiling #########")
@@ -124,8 +109,7 @@ with torch.autograd.profiler.profile(use_cuda=True) as prof:
     output_te = apply_rotary_pos_emb(x,freqs) #.to(torch.half)
 
 print(prof.key_averages().table(sort_by="cuda_time_total"))
-
-
+"""
 
 
 
